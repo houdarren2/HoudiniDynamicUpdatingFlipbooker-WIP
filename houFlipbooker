@@ -1,13 +1,29 @@
 from PySide2.QtWidgets import QSpacerItem, QSlider, QSizePolicy, QCheckBox, QTextEdit, QToolButton, QComboBox, QFrame, QHBoxLayout, QVBoxLayout, QWidget, QLabel, QLineEdit, QPushButton, QStatusBar, QFileDialog, QProgressBar, QMessageBox
-from PySide2.QtCore import Signal, Qt, QFileInfo, QThread, QTimer
+from PySide2.QtCore import QEvent, QCoreApplication, QMetaObject, Signal, Qt, QFileInfo, QThread, QTimer
 from PySide2 import QtCore, QtWidgets
 import sys
 import os
-import hou, toolutils, shutil, time, json, re, threading, tempfile
+import hou, toolutils, shutil, time, json, re, threading, tempfile, subprocess
 from hou import FlipbookSettings, SceneViewer, paneTabType, qt
 from PIL import Image, ImageDraw, ImageFont, ImageFile, ImageFilter
 from os import path
 import glob
+from collections import Counter
+#import ffmpeg
+
+class ProgressUpdateEvent(QEvent):
+    def __init__(self, progress_value):
+        super().__init__(QEvent.User)
+        self.progress_value = progress_value
+
+class ValueChangeSlider(QSlider):
+    value_change = Signal(int)
+
+    def __init__(self, parent = None):
+        super().__init__(parent)
+
+    def set_value(self, value):
+        self.value_change.emit(value)
 
 class HoverButton(QPushButton):
     show_status_tip_signal = Signal(str)
@@ -116,38 +132,53 @@ class FfmpegFileBrowser(QWidget):
 
 class ProgressBarThread(QThread):
     update_progress = Signal(int)
+    thread_progress = Signal(str)
 
-    def __init__(self):
+    def __init__(self, folder_path, file_ext, start_frame, end_frame):
         super().__init__()
-        self.file_list = []
+        #self.file_list = []
+        self.folder_path = folder_path
+        self.file_ext = file_ext
+        self.start_frame = start_frame
+        self.end_frame = end_frame
 
-    def run(self, folder_path, start_frame, end_frame):
+    def run(self):
         progress_completed = False
         progress_percentage = 0
-        total_frames = int(end_frame - start_frame) + 1
+        total_frames = int(self.end_frame - self.start_frame) + 1
 
-        while True:
-            current_file_list = os.listdir(folder_path)
-            new_files = [file for file in current_file_list if file not in self.file_list]
+        while not progress_completed:
+            current_file_list = [file for file in os.listdir(self.folder_path) if os.path.isfile("".join((self.folder_path, file))) and file.lower().endswith(self.file_ext)]
+            #new_files = [file for file in current_file_list if file not in self.file_list]
 
-            if new_files:
-                progress_percentage = int(round(len(self.file_list) / total_frames) * 100)
+            #test = "".lower().endswith("")
+
+            if len(current_file_list) > 0:
+                progress_percentage = int(round(len(current_file_list) / total_frames) * 100)
                 self.update_progress.emit(progress_percentage)
 
-                self.file_list = current_file_list
+                #self.file_list = current_file_list
+
+            self.thread_progress.emit("Thread Progressing")
 
             if progress_percentage == 100:
+                progress_completed = True
                 break
+        
+        self.update_progress.emit(100)
 
-        if progress_percentage == 100:
-            progress_completed = True
+    def handle_thread_progress(self, signal):
+        if signal == "Thread Progressing":
+            self.start_flipbook()
 
-        return progress_completed
+    def start_flipbook(self, scene, flipbook_options):
+        scene.flipbook(scene.curViewport(), flipbook_options)
 
 ##########################################################################################################
 # Init before Tool Starts
 def warn_user(self):
     reply = QMessageBox.warning(self, "Warning", "This Tool Requires an ffmpeg.exe file to Run the Video Conversion", QMessageBox.Ok, QMessageBox.Ok)
+
 
 def check_if_new_file(self):
     if hou.hipFile.isNewFile():
@@ -179,6 +210,10 @@ class DummyCommands:
 
     hip_formats = ("hip", "hiplc", "hipnc")
 
+    font_files_dir = [item for item in os.listdir(hou.text.expandString(os.path.expanduser("$HFS/houdini/fonts"))) if os.path.isfile(os.path.join(hou.text.expandString(os.path.expanduser("$HFS/houdini/fonts")), item)) and item.lower().endswith("ttf") or item.lower().endswith("otf")]
+
+    font_files= [os.path.splitext(file)[0].replace("-", " ") for file in os.listdir(hou.text.expandString(os.path.expanduser("$HFS/houdini/fonts"))) if os.path.isfile(os.path.join(hou.text.expandString(os.path.expanduser("$HFS/houdini/fonts")), file)) and file.lower().endswith("ttf") or file.lower().endswith("otf")]
+
     file_path = hou.hipFile.path()
     dir = path.dirname(file_path)
     ext = path.splitext(path.basename(file_path))[1]
@@ -187,7 +222,7 @@ class DummyCommands:
     #file_no_version = file_name.split("_")[:-1]
     #file_no_version = "_".join(file_no_version)
     
-    file_name_list = [item for item in file_name.split("_") if "v" not in item and any(char.isdigit() for char in item)]
+    file_name_list = [item for item in file_name.split("_") if "v" not in item and not any(char.isdigit() for char in item)]
     file_no_version = "_".join(file_name_list)
 
     def __init__(self):
@@ -195,7 +230,7 @@ class DummyCommands:
         self.cur_flipbook_format = "pic"
         self.cur_video_format = "ffmpeg"
 
-        self.flipbook_formats = ("pic", "png", "jpg", "tiff", )
+        self.flipbook_formats = ("pic", "png", "jpg", "tiff")
         self.video_formats = ("mp4", "mov", "avi")
 
     def current_flipbook_format(self):
@@ -229,7 +264,9 @@ class DummyCommands:
     def scan_dir_for_files(self, directory, match_name, formats):
         all_h_files = []
         for hformat in formats:
-            hfiles = glob.glob(directory+"/*.{}".format(hformat))
+            hfiles = glob.glob("{}/*.{}".format(directory, hformat))
+            hfiles = [item for item in os.listdir(directory) if hformat in item and os.path.isfile(os.path.join(directory, item).replace("\\", "/"))]
+            print("hfiles: {}".format(hfiles))
             for each_hfile in hfiles:
                 if match_name in each_hfile:
                     all_h_files.append(each_hfile)
@@ -239,16 +276,27 @@ class DummyCommands:
     def get_next_version(self, list_of_files):
         temp_ver = 0
         padzero = 0
+        pattern = r'v\d+'
+        matched = re.search(pattern, hou.hipFile.basename())
+        str_version = "1".zfill(padzero)
         for file_path in list_of_files:
             file_name = str(path.splitext(path.basename(file_path))[0])
             if "v" in file_name and any(item.isdigit() for item in file_name):
                 str_version = file_name.split("_")[1]
-
-            str_version_list = str_version.split("v")[-1]
-            #str_version = str(file_name.split["v"][-1])
-            str_version = "".join(str_version_list)
-            padzero = max(padzero, len(str_version))
-            temp_ver = max(temp_ver, int(str_version))
+                str_version_list = str_version.split("v")[-1]
+                str_version = "".join(str_version_list)
+                print("str version: {}".format(str_version))
+            elif matched:
+                str_version = file_name.split("_")[1]
+                str_version_list = str_version.split("v")[-1]
+                print("str version list: {}".format(str_version_list))
+                #str_version = str(file_name.split["v"][-1])
+                str_version = "".join(str_version_list)
+            else:
+                str_version = file_name.split("_")[1]
+            
+        padzero = max(padzero, len(str_version))
+        temp_ver = max(temp_ver, int(str_version))
 
         next_version = "{}".format(temp_ver + 1).zfill(padzero)
 
@@ -292,22 +340,39 @@ class FlipBookerWindow(QWidget):
 
         self.text_multi_line_edit = QTextEdit()
 
+        font_slider_default_value = 25
+
         self.font_slider = QSlider()
         self.font_slider.setOrientation(Qt.Horizontal)
         self.font_slider.setMinimum(1)
         self.font_slider.setMaximum(100)
-        self.font_slider.setValue(25)
+        self.font_slider.setValue(font_slider_default_value)
         self.font_slider.setFixedWidth(250)
         self.font_slider.setHidden(True)
+        
         self.font_slider_label = QLabel("Font Size:")
         self.font_slider_label.setHidden(True)
-        self.font_value_label = QLabel("25")
+        
+        self.font_value_label = QLabel("{}".format(str(font_slider_default_value)))
         self.font_value_label.setFixedWidth(20)
         self.font_value_label.setAlignment(Qt.AlignCenter)
         self.font_value_label.setHidden(True)
+
         self.all_viewport_checkbox = QCheckBox()
         self.all_viewport_checkbox.setChecked(False)
-        self.all_viewport_label = QLabel(" All Viewports:")
+        self.all_viewport_label = QLabel(" All Views:")
+
+        self.output_mplay_label = QLabel(" Output Mplay:")
+        self.output_mplay_label.setHidden(False)
+        self.output_mplay_checkbox = QCheckBox()
+        self.output_mplay_checkbox.setChecked(True)
+        self.output_mplay_checkbox.setHidden(False)
+
+        self.save_file_label = QLabel(" Save Files:")
+        self.save_file_label.setHidden(True)
+        self.save_file_checkbox = QCheckBox()
+        self.save_file_checkbox.setChecked(True)
+        self.save_file_checkbox.setHidden(True)
 
         [text_option_widget.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed) for text_option_widget in [self.font_slider_label, self.font_slider,
                                                                                                            self.font_value_label, self.all_viewport_checkbox,
@@ -316,9 +381,9 @@ class FlipBookerWindow(QWidget):
         self.before_spacer = QSpacerItem(2, 0, QSizePolicy.Minimum, QSizePolicy.Fixed)
         self.after_spacer = QSpacerItem(2, 0, QSizePolicy.Minimum, QSizePolicy.Fixed)
 
-        self.add_comment_checkbox_label = QLabel("Enable Commenting:")
+        self.add_comment_checkbox_label = QLabel("Enable Comment:")
         self.add_comment_checkbox = QCheckBox()
-        self.auto_back_checkbox_label = QLabel("Auto Backup:")
+        self.auto_back_checkbox_label = QLabel(" Auto Backup:")
         self.auto_back_checkbox = QCheckBox()
 
         [widget.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed) for widget in [self.add_comment_checkbox_label, self.add_comment_checkbox,
@@ -338,10 +403,11 @@ class FlipBookerWindow(QWidget):
         self.ver_select_combobox = QComboBox()
         self.ver_select_combobox.setEnabled(False)
 
+        self.set_font_combobox = QComboBox()
+        self.set_font_label = QLabel(" Font:")
+
         self.flipbook_format_select_combobox.setFixedSize(80, 20)
         self.video_format_select_combobox.setFixedSize(80, 20)
-
-        
 
 ########################################################################################
 # Handle Line Widget Settings
@@ -351,6 +417,10 @@ class FlipBookerWindow(QWidget):
         #self.text_multi_line_edit.setStyleSheet()
         self.text_multi_line_edit.setDisabled(True)
         self.text_multi_line_edit.setHidden(True)
+
+        self.set_font_label.setHidden(True)
+        self.set_font_combobox.setHidden(True)
+        self.set_font_combobox.setEnabled(False)
 
         self.add_comment_checkbox.setChecked(False)    #Fix this
         self.add_comment_checkbox.setCheckable(False)
@@ -416,11 +486,11 @@ class FlipBookerWindow(QWidget):
         self.ffmpeg_browse_btn = HoverButton("Browse", "Find Ffmpeg.exe Location", self)
 
         self.launch_flip_book_btn = HoverButton("Launch FlipBook", "Start Houdini Flip Book For Camera Path", self)
-        self.launch_flip_book_btn.setFixedSize(220, 20)
+        self.launch_flip_book_btn.setFixedSize(150, 20)
 
         self.convert_vid_btn = HoverButton("Encode FFMPEG", "Convert Flip Book Frames to Video Format of Your Choice", self)
         self.convert_vid_btn.setEnabled(False)
-        self.convert_vid_btn.setFixedSize(220, 20)
+        self.convert_vid_btn.setFixedSize(150, 20)
         
         self.flip_book_browse_btn = HoverButton("Browse Save Path", "Browse Folder Directory to Save FlipBook Frame", self)
         self.flip_book_browse_btn.setFixedWidth(154)
@@ -428,6 +498,9 @@ class FlipBookerWindow(QWidget):
         self.version_up_btn = HoverButton("Version Up", "Increment Version for Flipbook Directory", self)
         self.version_up_btn.setFixedHeight(20)
         self.version_up_btn.setEnabled(False)
+
+        self.attrib_reader_btn = HoverButton("Create Attribute Reader", "Creates an Attribute Reader and Attaches it to the Current Selected Camera", self)
+        self.attrib_reader_btn.setEnabled(False)
 
 ########################################################################################
 # Connect Buttons
@@ -443,6 +516,7 @@ class FlipBookerWindow(QWidget):
 
         self.convert_vid_btn.show_status_tip_signal.connect(self.update_status_tip)
         self.convert_vid_btn.clear_status_tip_signal.connect(self.clear_status_tip)
+        self.convert_vid_btn.clicked.connect(self.run_all_image_operations_and_encode)
 
         self.flip_book_browse_btn.show_status_tip_signal.connect(self.update_status_tip)
         self.flip_book_browse_btn.clear_status_tip_signal.connect(self.clear_status_tip)
@@ -453,8 +527,13 @@ class FlipBookerWindow(QWidget):
         self.version_up_btn.clicked.connect(self.version_up_mk_dir)
 
         self.camera_node_chooser.setNodeChooserFilter(hou.nodeTypeFilter.ObjCamera)
+        #self.camera_node_chooser.setSelectMultiple(1)
         self.camera_node_chooser.nodeSelected.connect(self.update_camera_line_edit)
         #self.camera_node_chooser.clear_status_tip_signal.connect(self.clear_status_tip)
+
+        self.camera_line_edit.textChanged.connect(self.check_camera_line_edit)
+
+        self.attrib_reader_btn.clicked.connect(lambda: self.create_attrib_reader(0.0, 1.0))
 
         self.name_line_edit.editingFinished.connect(self.update_name(name="$HIPNAME"))
 
@@ -470,6 +549,12 @@ class FlipBookerWindow(QWidget):
         self.add_comment_checkbox.stateChanged.connect(self.toggle_text_edit)
 
         self.all_viewport_checkbox.stateChanged.connect(self.update_all_viewport_checkbox)
+
+        self.save_file_checkbox.stateChanged.connect(self.update_all_viewport_checkbox)
+
+        self.output_mplay_checkbox.stateChanged.connect(self.update_all_viewport_checkbox)
+
+        self.auto_back_checkbox.stateChanged.connect(self.update_all_viewport_checkbox)
 
         #Autosave multiline edit
         self.text_multi_line_edit.textChanged.connect(self.stop_timer_on_edit)
@@ -497,6 +582,7 @@ class FlipBookerWindow(QWidget):
 
         self.camera_select_layout.addWidget(self.camera_label)
         self.camera_select_layout.addWidget(self.camera_line_edit)
+        self.camera_select_layout.addWidget(self.attrib_reader_btn)
         self.camera_select_layout.addWidget(self.camera_node_chooser)
 
         self.flip_book_save_layout.addWidget(self.flipbook_label)
@@ -517,10 +603,14 @@ class FlipBookerWindow(QWidget):
         self.checkbox_layout.addWidget(self.add_comment_checkbox)
         self.checkbox_layout.addWidget(self.auto_back_checkbox_label)
         self.checkbox_layout.addWidget(self.auto_back_checkbox)
-        self.checkbox_layout.addItem(self.before_spacer)
+        #self.checkbox_layout.addItem(self.before_spacer)
         self.checkbox_layout.addWidget(self.all_viewport_label)
-        self.checkbox_layout.addItem(self.after_spacer)
+        #self.checkbox_layout.addItem(self.after_spacer)
         self.checkbox_layout.addWidget(self.all_viewport_checkbox)
+        self.checkbox_layout.addWidget(self.output_mplay_label)
+        self.checkbox_layout.addWidget(self.output_mplay_checkbox)
+        self.checkbox_layout.addWidget(self.save_file_label)
+        self.checkbox_layout.addWidget(self.save_file_checkbox)
 
         self.button_checkbox_wrap_layout.addLayout(self.btn_layout)
         self.button_checkbox_wrap_layout.addLayout(self.checkbox_layout)
@@ -528,6 +618,9 @@ class FlipBookerWindow(QWidget):
         self.text_option_layout.addWidget(self.font_slider_label)
         self.text_option_layout.addWidget(self.font_value_label)
         self.text_option_layout.addWidget(self.font_slider)
+
+        self.text_option_layout.addWidget(self.set_font_label)
+        self.text_option_layout.addWidget(self.set_font_combobox)
         
 ########################################################################################
 # Add to Layout
@@ -573,6 +666,17 @@ class FlipBookerWindow(QWidget):
 
         self.last_all_viewport_check = self.all_viewport_checkbox.isChecked()
 
+        self.last_flipbook_combobox = self.flipbook_format_select_combobox.currentText()
+        self.last_video_combobox = self.video_format_select_combobox.currentText()
+
+        self.last_output_to_mplay_check = self.output_mplay_checkbox.isChecked()
+
+        self.last_save_file_check = self.save_file_checkbox.isChecked()
+
+        self.last_auto_bk_check = self.auto_back_checkbox.isChecked()
+
+        self.last_add_comment_check = self.add_comment_checkbox.isChecked()
+
         #self.thread = None
 
 ########################################################################################
@@ -589,6 +693,8 @@ class FlipBookerWindow(QWidget):
 # Version Selection Items
         self.ver_select_combobox.activated.connect(self.flipbook_ver_selected)
 
+        self.set_font_combobox.addItems(self.flipbook_video_format_selector.font_files)
+        self.set_font_combobox.currentIndexChanged.connect(self.font_ttf_selected)
 ########################################################################################
 # Update Status Tips and Font Label Value
 
@@ -601,11 +707,19 @@ class FlipBookerWindow(QWidget):
     def update_font_value(self, value):
         self.font_value_label.setText("{}".format(value))
         
+        font_size = self.font_slider.value()
+
+        font = self.text_multi_line_edit.font()
+
+        font.setPointSize(font_size)
+
+        self.text_multi_line_edit.setFont(font)
+
         cur_font_size = self.font_value_label.text()
         print("new value: {}".format(cur_font_size))
 
         if self.last_font_size != cur_font_size and self.add_comment_checkbox.isChecked():
-            self.timer.singleShot(500, self.comment_on_text_change)
+            self.timer.singleShot(0, self.comment_on_text_change)
             print("starting update font size timer")
         else:
             self.timer.stop()
@@ -613,12 +727,14 @@ class FlipBookerWindow(QWidget):
         return value
     
     def update_all_viewport_checkbox(self):
-        
+        cur_auto_bk_check = self.auto_back_checkbox.isChecked()
         cur_last_all_viewport_check = self.all_viewport_checkbox.isChecked()
+        cur_output_mplay = self.output_mplay_checkbox.isChecked()
+        cur_save_file = self.save_file_checkbox.isChecked()
         print("new viewport checkbox state: {}".format(cur_last_all_viewport_check))
 
-        if self.last_all_viewport_check != cur_last_all_viewport_check:
-            self.timer.singleShot(500, self.comment_on_text_change)
+        if self.last_auto_bk_check != cur_auto_bk_check or self.last_all_viewport_check != cur_last_all_viewport_check or self.last_output_to_mplay_check != cur_output_mplay or self.last_save_file_check != cur_save_file:
+            self.timer.singleShot(0, self.comment_on_text_change)
             print("starting update all viewport checkbox timer")
         else:
             self.timer.stop()
@@ -644,6 +760,7 @@ class FlipBookerWindow(QWidget):
         has_ffmpeg = True if check_string in ffmpeg_text else False
         path_to_eval = self.update_flipbook_combobox()
         has_ver = True if len(path_to_eval) > 0 else False
+        flipbook_format = self.flipbook_format_select_combobox.currentText()
 
         self.convert_vid_btn.setEnabled(has_ffmpeg)
         self.ver_select_combobox.setEnabled(has_ver)
@@ -652,18 +769,43 @@ class FlipBookerWindow(QWidget):
             self.add_comment_checkbox.setEnabled(True)
             self.add_comment_checkbox.setCheckable(True)
             self.version_up_btn.setEnabled(True)
-            
+            self.save_file_label.setHidden(False)
+            self.save_file_checkbox.setHidden(False)
+
         else:
             self.add_comment_checkbox.setEnabled(False)
             self.add_comment_checkbox.setCheckable(False)
             self.version_up_btn.setEnabled(False)
+            self.save_file_label.setHidden(True)
+            self.save_file_checkbox.setHidden(True)
+
+        if "pic" in flipbook_format:
+            #self.text_multi_line_edit.hide(True)
+            #self.stop_timer_on_edit()
+            self.add_comment_checkbox.setChecked(False)
+            self.add_comment_checkbox.setEnabled(False)
+            self.add_comment_checkbox.setHidden(True)
+            self.add_comment_checkbox_label.setHidden(True)
+            self.text_multi_line_edit.setDisabled(True)
+            self.text_multi_line_edit.setHidden(True)
+            self.set_font_combobox.setHidden(True)
+            self.set_font_label.setHidden(True)
+            self.set_font_combobox.setEnabled(False)
+        else:
+            self.add_comment_checkbox.setEnabled(True)
+            self.add_comment_checkbox.setHidden(False)
+            self.add_comment_checkbox_label.setHidden(False)
+            self.text_multi_line_edit.setDisabled(False)
+            self.set_font_combobox.setEnabled(True)
 
     def toggle_text_edit(self, state):
         
+        self.stop_timer_on_edit()
+
         settings_file = self.flipbook_video_format_selector.get_json_path(self.flipbook_line_edit.text())
         print(settings_file)
 
-        info, tempdir = self.read_json_settings(settings_file)
+        info, tempdir, input_path_bk = self.read_json_settings(settings_file)
 
         if self.has_been_toggled is False:
             if state == 2:
@@ -675,6 +817,10 @@ class FlipBookerWindow(QWidget):
                 self.font_value_label.setHidden(False)
                 self.setFixedHeight(new_window_y)
                 self.has_been_toggled = True
+                
+                self.set_font_label.setHidden(False)
+                self.set_font_combobox.setHidden(False)
+                self.set_font_combobox.setEnabled(True)
             else:
                 self.text_multi_line_edit.setDisabled(True)
                 self.text_multi_line_edit.setHidden(True)
@@ -692,6 +838,10 @@ class FlipBookerWindow(QWidget):
                 self.setFixedHeight(new_window_y)
                 self.text_multi_line_edit.setPlainText(self.initial_text)
 
+                self.set_font_label.setHidden(False)
+                self.set_font_combobox.setHidden(False)
+                self.set_font_combobox.setEnabled(True)
+
             else:
                 self.text_multi_line_edit.setDisabled(True)
                 self.text_multi_line_edit.setHidden(True)
@@ -705,14 +855,37 @@ class FlipBookerWindow(QWidget):
 # Handle ComboBox Selections
 
     def flipbook_format_selected(self, index):
+        self.stop_timer_on_edit()
+
         flipbook_format = self.flipbook_format_select_combobox.currentText()
 
         self.flipbook_video_format_selector.select_flipbook_format(flipbook_format)
 
+        if flipbook_format == "pic":
+            #self.text_multi_line_edit.hide(True)
+            #self.stop_timer_on_edit()
+            self.add_comment_checkbox.setChecked(False)
+            self.add_comment_checkbox.setHidden(True)
+            self.add_comment_checkbox.setEnabled(False)
+            self.add_comment_checkbox_label.setHidden(True)
+            self.text_multi_line_edit.setDisabled(True)
+            self.text_multi_line_edit.setHidden(True)
+            self.setFixedHeight(window_y)
+
+            self.status_bar.showMessage("Houdini PIC files are not compatible with overlaying comments", 5000)
+        else:
+            self.add_comment_checkbox.setHidden(False)
+            self.add_comment_checkbox.setEnabled(True)
+            self.add_comment_checkbox_label.setHidden(False)
+            self.text_multi_line_edit.setDisabled(False)
+
         print("Current Seleted Flipbook Format: {}".format(flipbook_format))    #Debug
 
     def video_format_selected(self, index):
+        self.stop_timer_on_edit()
+
         video_format = self.video_format_select_combobox.currentText()
+
         self.flipbook_video_format_selector.select_video_format(video_format)
 
         print("Current Selected Video Format: {}".format(video_format))
@@ -749,7 +922,7 @@ class FlipBookerWindow(QWidget):
             path_list = os.listdir(init_dir)    #change to list comprehension
             if len(path_list) > 0:
 
-                ver_num_list = [int(digit[1:]) for digit in path_list]
+                ver_num_list = [int(digit[1:]) for digit in path_list if digit[1:].isdigit()]
                 print("Version Numbers Available: {}".format(ver_num_list))
 
                 max_ver_num = max(ver_num_list)
@@ -769,7 +942,7 @@ class FlipBookerWindow(QWidget):
                 if reply == QMessageBox.No:
                     dir_path = output_path
                     print("Reading JSON file from QMessage Box No Option with dir path being: {}".format(dir_path))    #Debug
-                    info, tempdir = self.read_json_settings(self.flipbook_video_format_selector.get_json_path(dir_path))
+                    info, tempdir, input_path_bk = self.read_json_settings(self.flipbook_video_format_selector.get_json_path(dir_path))
                     use_new_dir = False
 
         else:
@@ -784,10 +957,67 @@ class FlipBookerWindow(QWidget):
             new_list = [item for item in dir_list if item not in folder_list]        
             print("list with difference: {}".format(new_list))    #Debug
 
+            dir_count = dict()
+            folder_count = dict()
+
+            dir_order_list = list()
+            folder_order_list = list()
+
+            # get the index number for where the two lists show a difference in their iterable items
+            # compare dir_list and folder_list directly, and handle the case where there is no difference
+            marker_index = next((index for index, items in enumerate(zip(dir_list, folder_list)) if items[0] != items[1]), len(dir_list))
+            print("marker_index: {}".format(marker_index))
+            # init marker by default will be False
+
+            for index, dir_item in enumerate(dir_list):
+                if dir_item not in dir_count:
+                    dir_order_list.append(dir_item)
+                    print("iterating through Index: {}".format(index))
+                dir_count[dir_item] = dir_count.get(dir_item, 0) + 1
+                print("dir_count viz: {}".format(dir_count[dir_item]))
+                print("order_list: {}".format(dir_order_list))
+
+            for folder_item in folder_list:
+                if folder_item not in folder_count:
+                    folder_order_list.append(folder_item)
+                folder_count[folder_item] = folder_count.get(folder_item, 0) + 1
+                print("folder_count viz: {}".format(folder_count[folder_item]))
+
+            print("dir_count overall: {}".format(dir_count))
+            print("folder_count overall: {}".format(folder_count))
+
+            difference_count = dict()
+
+            # Visualize dictionaries
+            '''
+            for key, value in dir_count.items():
+                print("dir_count key: {}".format(key))
+                print("dir_count value: {}".format(value))
+
+            for key, value in folder_count.items():
+                print("folder_count key: {}".format(key))
+                print("folder_count value: {}".format(value))
+
+            for item, count in dir_count.items():
+                print("item: {}, count: {}".format(item, count))
+            '''
+
+            # Check if marker_index is not None and not past_marker
+            for item in dir_order_list + folder_order_list:
+                if item not in difference_count:
+                    difference_count[item] = dir_count.get(item, 0) - folder_count.get(item, 0)
+                    print("difference_count: {}".format(difference_count[item]))
+
+            new_list = [item for item, count in difference_count.items() if count > 0]
+            print("new_list with difference: {}".format(new_list))
+
             new_dir = str()
 
+            count_difference = 0
+
             for directory in new_list:
-                if directory not in folder_list:
+                count_difference = dir_count.get(directory, 0) - folder_count.get(directory, 0)
+                if count_difference > 0:
                     new_dir = "".join([folder_path_text, "/", directory])
                     print("Creating Intermittent Dirs: {}".format(new_dir))    #Debug
                     if not os.path.exists(new_dir):
@@ -798,12 +1028,13 @@ class FlipBookerWindow(QWidget):
             
             self.save_json_settings(folder_path_text)
             json_path = self.flipbook_video_format_selector.get_json_path(folder_path_text)
-            info, tempdir = self.read_json_settings(json_path)
+            info, tempdir, input_path_bk = self.read_json_settings(json_path)
             output_path = init_path
 
         self.update_flipbook_video_line_edit(output_path)
         self.update_flipbook_combobox()
         self.check_enabled()
+
         self.ver_select_combobox.setCurrentIndex(int(max_ver_num) - 1)
 
         settings_file = self.flipbook_video_format_selector.get_json_path(self.flipbook_line_edit.text())
@@ -826,25 +1057,32 @@ class FlipBookerWindow(QWidget):
 
         default_path = json_save_path
 
-        settings_dir = "".join([default_path,"/flipbook_settings/"])
+        original_path = self.flipbook_line_edit.text()
+
+        settings_dir = "".join([default_path,"/flipbook_settings/"]).replace("//", "/")
         settings_file_name = "settings.json"
-        settings_file = "".join([settings_dir, settings_file_name])
+        settings_file = "".join([settings_dir, settings_file_name]).replace("//", "/")
+
+        current_font_text = self.set_font_combobox.currentText()
+        current_font_index = self.set_font_combobox.findText(current_font_text)
 
         if not os.path.exists(settings_dir):
             os.mkdir(settings_dir)
             with open(settings_file, 'w') as file:
                 info = {"video_format": "mp4",
+                        "flipbook_format": "pic",
                         "start_frame": "$RFSTART",
                         "end_frame": "$RFEND",
                         "all_viewports": False,
                         "auto_backup": True,
-                        "comment": True,
+                        "comment": False,
                         "font_size":25,
-                        "sys_font_path": "C:\\Windows\\Fonts\\arialbd.ttf",
-                        "custom_font": False,
+                        "sys_font_path": self.flipbook_video_format_selector.font_files_dir[current_font_index],
                         "comment_text": "[shotcam]\n'$F'/'$FEND'",
                         "width": 500,
                         "height": 300,
+                        "output_mplay": False,
+                        "save_file": True
                         }
             
                 file.write(json.dumps(info, indent=4))
@@ -855,7 +1093,8 @@ class FlipBookerWindow(QWidget):
     def read_json_settings(self, settings_file):
         # Fetch Data if it already Exists
         #settings_file = json_path  #json_path is the original method provided variable added
-        
+        original_path = hou.text.expandString(self.flipbook_line_edit.text())
+
         print("read json settings path: {}".format(settings_file))        
         
         try:
@@ -870,7 +1109,7 @@ class FlipBookerWindow(QWidget):
                 path_concat = "/".join(path_list)
                 file_dir = "/".join([path_concat, cur_ver])
                 
-                settings_file = "/".join([file_dir, "flipbook_settings", "settings.json"])
+                settings_file = "/".join([file_dir, "flipbook_settings", "settings.json"]).replace("//", "/")
                 print("File Dir for Reading JSON is: {}".format(settings_file)) #Debug
         except Exception as e:
             print("Exception error:\n{}".format(e))
@@ -883,25 +1122,6 @@ class FlipBookerWindow(QWidget):
                 print("Reading JSON File...")
                 file.close()
 
-        #establish global variables for all settings
-
-        #global video_format, start_frame, end_frame, all_viewports, auto_back, comment, font_size, sys_font_path, custom_font, comment_text, width, height
-        '''
-        video_format = info['video_format']
-        start_frame = info['start_frame']
-        end_frame = info["end_frame"]
-        all_viewports = info["all_viewports"]
-        auto_back = info["auto_backup"]
-        comment = info["comment"]
-        font_size = info["font_size"]
-        sys_font_path = info["sys_font_path"]
-        custom_font = info["custom_font"]
-        comment_text = info["comment_text"]
-        width = info["width"]
-        height = info["height"]
-
-        video_format = video_format[0]
-        '''
         name = hou.text.expandString(self.name_line_edit.text())
 
         #create temp directory for text
@@ -923,7 +1143,7 @@ class FlipBookerWindow(QWidget):
         if not os.path.exists(input_path_bk):
             os.mkdir(input_path_bk)
 
-        return info, tempdir
+        return info, tempdir, input_path_bk
         
     def overwrite_existing_json_text(self):
 
@@ -937,18 +1157,23 @@ class FlipBookerWindow(QWidget):
             existing_data = json.loads(file.read())
             file.close()
 
+        current_font_text = self.set_font_combobox.currentText()
+        current_font_index = self.set_font_combobox.findText(current_font_text)
+
         updates = {"video_format": self.video_format_select_combobox.currentText(),
+                   "flipbook_format": self.flipbook_format_select_combobox.currentText(),
                    "start_frame": self.flipbook_start_frame_line_edit.text(),
                    "end_frame": self.flipbook_end_frame_line_edit.text(),
                    "all_viewports": True if self.all_viewport_checkbox.isChecked() else False,
                    "auto_backup": True if self.auto_back_checkbox.isChecked() else False,
                    "comment": True if self.add_comment_checkbox.isChecked() else False,
                    "font_size": int(self.font_value_label.text().replace(" ", "")),
-                   "sys_font_path": "C:\\Windows\\Fonts\\arialbd.ttf",
-                   "custom_font": False,
+                   "sys_font_path": self.flipbook_video_format_selector.font_files_dir[current_font_index],
                    "comment_text": self.text_multi_line_edit.toPlainText(),
                    "width": 500,
                    "height": 300,
+                   "output_mplay": True if self.output_mplay_checkbox.isChecked() else False,
+                    "save_file": True if self.save_file_checkbox.isChecked() else False
                    }
 
         code_executed = True
@@ -965,29 +1190,31 @@ class FlipBookerWindow(QWidget):
         self.read_json_settings(settings_file)
 
     def stop_timer_on_edit(self):
-        cur_text = self.text_multi_line_edit.toPlainText()
+        current_text = self.text_multi_line_edit.toPlainText()
+        cur_flipbook_format = self.flipbook_format_select_combobox.currentText()
+        cur_video_format = self.video_format_select_combobox.currentText()
+        cur_add_comment_check = self.add_comment_checkbox.isChecked()
         
-        if self.last_text != cur_text and self.add_comment_checkbox.isChecked():
-            self.timer.singleShot(500, self.comment_on_text_change)
+        if cur_add_comment_check != self.last_add_comment_check or self.last_text != current_text or cur_flipbook_format != self.last_flipbook_combobox or cur_video_format != self.last_video_combobox:
+            self.timer.singleShot(0, self.comment_on_text_change)
             print("starting timer")    #Debug
         else:
             self.timer.stop()
 
     def comment_on_text_change(self):
-        self.timer.start(3000)     #how long to autosave in miliseconds
+        self.timer.start(500)     #how long to autosave in miliseconds
 
     def process_on_text_change(self):
         current_text = self.text_multi_line_edit.toPlainText()
-        cur_font_size = self.font_value_label.text()
+        cur_flipbook_format = self.flipbook_format_select_combobox.currentText()
+        cur_video_format = self.video_format_select_combobox.currentText()
+        cur_output_mplay = self.output_mplay_checkbox.isChecked()
+        cur_save_file = self.save_file_checkbox.isChecked()
         cur_last_all_viewport_check = self.all_viewport_checkbox.isChecked()
+        cur_auto_bk_check = self.auto_back_checkbox.isChecked()
+        cur_add_comment_check = self.add_comment_checkbox.isChecked()
         try:
-            if current_text != self.last_text:
-                self.overwrite_existing_json_text()
-                self.status_bar.showMessage("Saving New JSON Settings", 3000)    #show status message for how long in miliseconds
-            if cur_font_size != self.last_font_size:
-                self.overwrite_existing_json_text()
-                self.status_bar.showMessage("Saving New JSON Settings", 3000)    #show status message for how long in miliseconds
-            if cur_last_all_viewport_check != self.last_all_viewport_check:
+            if cur_add_comment_check != self.last_add_comment_check or cur_auto_bk_check != self.last_auto_bk_check or cur_last_all_viewport_check != self.last_all_viewport_check or current_text != self.last_text or cur_flipbook_format != self.last_flipbook_combobox or cur_video_format != self.last_video_combobox or cur_output_mplay != self.last_output_to_mplay_check or cur_save_file != self.last_save_file_check:
                 self.overwrite_existing_json_text()
                 self.status_bar.showMessage("Saving New JSON Settings", 3000)    #show status message for how long in miliseconds
         except Exception as e:
@@ -995,12 +1222,41 @@ class FlipBookerWindow(QWidget):
             print("Exception error debug:\n{}".format(e))
 
         self.last_text = current_text
-        self.last_font_size = cur_font_size
+        self.last_flipbook_combobox = cur_flipbook_format
+        self.last_video_combobox = cur_video_format
+        self.last_output_to_mplay_check = cur_output_mplay
+        self.last_save_file_check = cur_save_file
         self.last_all_viewport_check = cur_last_all_viewport_check
+        self.last_auto_bk_check = cur_auto_bk_check
+        self.last_add_comment_check = cur_add_comment_check
         print("last text is now set to: {}".format(self.last_text))
         self.timer.stop()
         print("Keeping original text")
         
+########################################################################################
+# Handle Set Font Combo Box
+    def font_ttf_selected(self, index):
+        self.stop_timer_on_edit()
+
+        font_selected = self.set_font_combobox.itemText(index).replace(" ", "-")
+
+        font_directory = hou.text.expandString(os.path.expanduser("$HFS/houdini/fonts"))
+
+        font_files_list = [item for item in os.listdir(font_directory) if item.lower().endswith("ttf") or item.lower().endswith("otf")]
+
+        font_extension = font_files_list[index].split(".")[-1]
+        print("temp font extension: {}".format(font_extension))
+
+        font_to_load = "".join([os.path.join(font_directory, font_selected).replace("\\", "/"), ".", font_extension])
+        print("font to load: {}".format(font_to_load))
+
+        font = self.text_multi_line_edit.font()
+
+        font.setFamily(font_to_load)
+
+        self.text_multi_line_edit.setFont(font)
+
+        #self.text_multi_line_edit.setFont(font_to_load)
 ########################################################################################
 # Handle Version Combo Box
 
@@ -1023,13 +1279,17 @@ class FlipBookerWindow(QWidget):
 
         settings_file = self.flipbook_video_format_selector.get_json_path(self.flipbook_line_edit.text())
 
-        info, tempdir = self.read_json_settings(settings_file)
+        if not os.path.exists(settings_file):
+            self.save_json_settings(self.flipbook_line_edit.text())
+        info, tempdir, input_path_bk = self.read_json_settings(settings_file)
         #self.check_enabled()   #Come back to this later
 
         self.text_multi_line_edit.setText(info["comment_text"])
         self.font_slider.setValue(info['font_size'])
         self.all_viewport_checkbox.setChecked(info['all_viewports'])
         self.auto_back_checkbox.setChecked(info['auto_backup'])
+        self.output_mplay_checkbox.setChecked(info['output_mplay'])
+        self.save_file_checkbox.setChecked(info['save_file'])
 
         return cur_ver
 
@@ -1037,7 +1297,9 @@ class FlipBookerWindow(QWidget):
         path_to_eval_list = self.flipbook_line_edit.text().split("/")
         path_to_eval_list.pop(-1)
         path_to_eval = "/".join(path_to_eval_list)
-        cur_ver_list = os.listdir(path_to_eval)
+        all_dir_list = os.listdir(path_to_eval)
+        cur_ver_list = [digit for digit in all_dir_list if digit[1:].isdigit()]
+        print("update_flipbook_combobox cur_ver_list: {}".format(cur_ver_list))
 
         if self.instance_sort is None:
             self.instance_sort = self.flipbook_video_format_selector
@@ -1048,6 +1310,8 @@ class FlipBookerWindow(QWidget):
 
         self.ver_select_combobox.clear()
         self.ver_select_combobox.addItems(sorted_ver_list)
+
+        #self.check_enabled()    ########################
 
         return cur_ver_list
     
@@ -1106,7 +1370,7 @@ class FlipBookerWindow(QWidget):
         settings_file = self.flipbook_video_format_selector.get_json_path(self.flipbook_line_edit.text())
 
         self.save_json_settings(change_flipbook_line)
-        info, tempdir = self.read_json_settings(settings_file)
+        info, tempdir, input_path_bk = self.read_json_settings(settings_file)
         self.update_flipbook_combobox()
 
         items = [self.ver_select_combobox.itemText(item) for item in range(self.ver_select_combobox.count())]
@@ -1118,6 +1382,7 @@ class FlipBookerWindow(QWidget):
         item_index_to_set = self.ver_select_combobox.findText(item_version)
 
         self.ver_select_combobox.setCurrentIndex(item_index_to_set)
+        self.check_enabled()
 
 ########################################################################################
 # File Dialog for FFMPEG
@@ -1151,6 +1416,250 @@ class FlipBookerWindow(QWidget):
     def update_camera_line_edit(self, node):
         print("Firing Update Camera")   #Debug
         self.camera_line_edit.setText(node.path())
+
+    def check_camera_line_edit(self):
+        camera_node = hou.node("{}".format(self.camera_line_edit.text()))
+        if camera_node:
+            self.attrib_reader_btn.setEnabled(True)
+        else:
+            self.attrib_reader_btn.setEnabled(False)
+
+    def create_attrib_reader(self, pos_x_padding, pos_y_padding):
+        
+        camera_node = hou.node("{}".format(self.camera_line_edit.text()))
+
+        obj_level = hou.node("/obj")
+        sop_level = obj_level.createNode('geo', node_name="attribute_reader")
+        sop_level_parm = sop_level.parmTemplateGroup()
+        
+        camera_position = camera_node.position()
+        #print("camera_position: {}".format(camera_position))
+
+        sop_level_node = hou.node("{}".format(sop_level.path()))
+        sop_level_position = sop_level_node.position()
+        #print("sop_level_position: {}".format(sop_level_position))
+
+        camera_node_parent = toolutils.findGreatestCommonDescendent(camera_node, searchnodes=[], seennodes=None)
+        #print("camera_node_parent: {}".format(camera_node_parent))
+
+        camera_node_parent_node = hou.node("{}".format(camera_node_parent.path()))
+        camera_node_parent_position = camera_node_parent_node.position()
+
+        position_difference = camera_node_parent_position - sop_level_position
+
+        position_difference_x = position_difference[0]
+        position_difference_y = position_difference[1]
+
+        sop_level.setPosition([position_difference_x + pos_x_padding, position_difference_y + pos_y_padding])
+
+        camera_node_parent_node.setInput(0, sop_level)
+
+        #print("position_difference: {}".format(position_difference))
+
+        '''
+        sop_comments_folder = hou.FolderParmTemplate(
+            "attrib_reader",
+            "Attribute Reader",
+            folder_type = hou.folderType.Tabs
+
+        )
+        sop_level_parm.insertBefore("stdswitcher4", sop_comments_folder)    #stdswitcher4 is the default name for the Transform Folder, so we put it in front of that
+        
+        attribute_reader_folder = sop_level_parm.findFolder("Attribute Reader")
+        '''
+        
+        sop_level.addControlParmFolder(folder_name="Attribute Reader", parm_name = "attrib_reader")
+
+        color_parm_template = hou.FloatParmTemplate("font_color", "Font Color", 3, default_value=(1, 1, 1), min=0, max=1, naming_scheme=hou.parmNamingScheme.RGBA)
+
+        '''
+        comments_node = sop_level.createNode('null', node_name='comments')
+        comments_node_parm = comments_node.parmTemplateGroup()
+
+        comments_parameter_name = {"comments": "Comments"}
+        comments_parameter_template = {"comment_text_#": "Comment Text #"}
+
+        
+        print(comments_parameter_name.keys())
+        print(comments_parameter_name.values())
+
+        print(comments_parameter_template.keys())
+        print(comments_parameter_template.values())
+        
+        '''
+        comments_folder = hou.FolderParmTemplate(
+            "comments",
+            "Comments",
+            folder_type=hou.folderType.MultiparmBlock,
+            parm_templates=[
+                hou.StringParmTemplate("comment_text_#", "Comment Text #", 1)
+
+            ]
+        )
+
+        text_dist_to_cam_padding = hou.FloatParmTemplate("cam_padding", "Font Camera Distance Padding", 1, default_value=[0.02],)
+        text_padding_screen_space_padding= hou.FloatParmTemplate("text_screen_padding", "Text Screen Space Position Padding", 2, default_value=[0.015, 0.015],)
+        font_size_parm= hou.FloatParmTemplate("font_size", "Font Size", 1, default_value=[1],)
+        space_between_text_parm = hou.FloatParmTemplate("space_between_text", "Space Between Text", 1, default_value=[0], min=-1, max=1)
+
+        font_directory = hou.text.expandString(os.path.expanduser("$HFS/houdini/fonts"))
+
+        font_files = [file for file in os.listdir(font_directory) if os.path.isfile(os.path.join(font_directory, file))]
+        #print("font files: {}".format(font_files))
+
+        font_files_prefix = [os.path.splitext(file)[0].replace("-", " ") for file in font_files]
+        print("font file prefix: {}".format(font_files_prefix))
+
+        font_name = "font"
+
+        font_file_template = hou.StringParmTemplate(font_name, "Font", 1, default_value=("Lato Bold",), string_type=hou.stringParmType.FileReference, menu_items=(font_files_prefix), menu_type=hou.menuType.StringReplace)
+        font_file_template.setScriptCallbackLanguage(hou.scriptLanguage.Hscript)
+        font_file_template.setTags({"editor": "main tool",
+                                    "filechooser_pattern": "*.ttf, *.otf, *.ttc, *.otc, *.pfa, *.pfb", 
+                                    "filechooser_mode": "read", 
+                                    "filechooser_start_directory": "{}".format(font_directory)})
+        
+        '''
+        # Create a StringParmTemplate for selecting the font
+        font_file_template = hou.StringParmTemplate("font", "Font", 1, default_value=("",),
+                                       string_type=hou.stringParmType.FileReference,
+                                       menu_items=(font_files, font_files))
+
+        # Set a script to dynamically populate the menu items
+        script = 'return [("{}","{}") for {} in {}]'.format('{}', '{}', '{}', font_files)
+        font_file_template.setScriptCallback(('menu', script))
+        '''
+
+        camera_path_parm_name = 'camera_path'
+
+        camera_path_parm = hou.StringParmTemplate("{}".format(camera_path_parm_name), "Camera Path", 1, default_value=(["{}".format(self.camera_line_edit.text())]), naming_scheme=hou.parmNamingScheme.Base1, string_type=hou.stringParmType.NodeReference, menu_items=([]), menu_labels=([]), icon_names=([]), item_generator_script="", item_generator_script_language=hou.scriptLanguage.Python, menu_type=hou.menuType.Normal)
+        camera_path_parm.setScriptCallbackLanguage(hou.scriptLanguage.Python)
+        camera_path_parm.setTags({"opfilter": "!!OBJ/CAMERA!!", "oprelative": ".", "script_callback_language": "python"})
+
+        attrib_reader_parm_name = 'attrib_reader_path'
+
+        attrib_reader_parm_path = hou.StringParmTemplate("{}".format(attrib_reader_parm_name), "Attribute Reader Path", 1, default_value=(["{}".format(sop_level.path())]), naming_scheme=hou.parmNamingScheme.Base1, string_type=hou.stringParmType.NodeReference, menu_items=([]), menu_labels=([]), icon_names=([]), item_generator_script="", item_generator_script_language=hou.scriptLanguage.Python, menu_type=hou.menuType.Normal)
+        attrib_reader_parm_path.setScriptCallbackLanguage(hou.scriptLanguage.Python)
+        attrib_reader_parm_path.setTags({"opfilter": "!!OBJ/GEOMETRY!!", "oprelative": ".", "script_callback_language": "python"})
+
+        sop_level.addSpareParmTuple(font_file_template, in_folder=("Attribute Reader", ))
+        sop_level.addSpareParmTuple(attrib_reader_parm_path, in_folder=("Attribute Reader", ))
+        sop_level.addSpareParmTuple(camera_path_parm, in_folder=("Attribute Reader", ))
+        sop_level.addSpareParmTuple(color_parm_template, in_folder=("Attribute Reader", ))
+        sop_level.addSpareParmTuple(font_size_parm, in_folder=("Attribute Reader", ))
+        sop_level.addSpareParmTuple(space_between_text_parm, in_folder=("Attribute Reader", ))
+        sop_level.addSpareParmTuple(text_dist_to_cam_padding, in_folder=("Attribute Reader", ))
+        sop_level.addSpareParmTuple(text_padding_screen_space_padding, in_folder=("Attribute Reader", ))
+        sop_level.addSpareParmTuple(comments_folder, in_folder=("Attribute Reader", ))
+
+        #Absolute path references for parameters
+        attrib_reader_abs_path = "ch('{}')".format("../{}".format(attrib_reader_parm_name))
+        cam_near_clip = 'ch("{}")'.format(camera_node.parm("near").path())
+        cam_clip_padding = 'ch("{}")'.format(sop_level_node.parm("cam_padding").path())
+        source_font_x_padding = 'ch("{}")'.format(sop_level_node.parm("text_screen_paddingx").path())
+        source_font_y_padding = 'ch("{}")'.format(sop_level_node.parm("text_screen_paddingy").path())
+        font_size = 'ch("{}")'.format(sop_level_node.parm("font_size").path())
+        space_between_text = 'ch("{}")'.format(sop_level_node.parm("space_between_text").path())
+        camera_abs_path = "ch('{}')".format("../{}".format(camera_path_parm_name))
+        #font_parm.setExpression(expression, language=Python)
+        font_rel_path = '`chs("{}")`'.format("../{}".format(font_name))
+
+        font_node = sop_level.createNode('font')
+        font_parm = font_node.parm("text")
+        font_dummy_keyframe = hou.StringKeyframe()
+        font_dummy_keyframe.setFrame(0)
+        font_dummy_keyframe.setExpression("import hou\ncomments_node = hou.node({})\n\ncomments = []\n\nnum_comments = comments_node.parm(\"comments\").evalAsInt() + 1\n\nfor i in range(1, num_comments):\n    comment = comments_node.parm(f\"comment_text_{}\").evalAsString()\n    comments.append(comment)\n\nreturn \"\\n\".join(comments)".format(attrib_reader_abs_path, "{i}"), hou.exprLanguage.Python)
+        #font_dummy_keyframe.setExpression("import hou\ncomments_node = hou.node(\"{comments_node}\")\n\ncomments = []\n\nnum_comments = comments_node.parm(\"comments\").evalAsInt() + 1\n\nfor i in range(1, num_comments):\n    comment = comments_node.parm(f\"comment_text_{i}\").evalAsString()\n    comments.append(comment)\n\nreturn \"\\n\".join(comments)", hou.exprLanguage.Python)
+        font_parm.setKeyframe(font_dummy_keyframe)
+
+        font_node_path = font_node.path()
+        font_node = hou.node("{}".format(font_node_path))
+      
+        font_node.parm("halign").set("left")
+        font_node.parm("valign").set("bottom")
+
+        font_node.parm('fontsize').setExpression("{} * 0.01".format(font_size))
+        font_node.parm("tx").setExpression("{}".format(source_font_x_padding))
+        font_node.parm("ty").setExpression("{}".format(source_font_y_padding))
+        font_node.parm("tz").setExpression("({} * -1) - {}".format(cam_near_clip, cam_clip_padding))
+        font_node.parm("sy").set(1.5)
+        font_node.parm("trackingy").setExpression("{}".format(space_between_text))
+        font_node.parm("file").set("{}".format(font_rel_path))
+
+        source_color_r = 'ch("{}")'.format(sop_level_node.parm("font_colorr").path())
+        source_color_g = 'ch("{}")'.format(sop_level_node.parm("font_colorg").path())
+        source_color_b = 'ch("{}")'.format(sop_level_node.parm("font_colorb").path())
+
+        color_sop = sop_level.createNode('color', node_name='set_font_color')
+        color_sop.setInput(0, font_node)
+
+        color_node = hou.node("{}".format(color_sop.path()))
+        color_node.parm("colorr").setExpression("{}".format(source_color_r))
+        color_node.parm("colorg").setExpression("{}".format(source_color_g))
+        color_node.parm("colorb").setExpression("{}".format(source_color_b))
+
+        camera_space_wrangle_node = sop_level.createNode('attribwrangle', node_name='read_camera_space')
+        camera_space_wrangle_node.setInput(0, color_sop)
+
+        camera_wrangle_snippet = camera_space_wrangle_node.parm("snippet")
+        camera_vex_snippet = "v@P = fromNDC({}, v@P);".format(camera_abs_path)
+        camera_wrangle_snippet.set(camera_vex_snippet)
+
+        gl_lit_node = sop_level.createNode('attribwrangle', node_name='set_gl_lit')
+        gl_lit_node.setInput(0, camera_space_wrangle_node)
+        gl_lit_node.parm("class").set("detail")
+
+        gl_lit_snippet = gl_lit_node.parm("snippet")
+        gl_vex_snippet = "i@gl_lit = 0;"
+        gl_lit_snippet.set(gl_vex_snippet)
+
+        output_node = sop_level.createNode('output', node_name='Output')
+        output_node.setInput(0, gl_lit_node)
+        
+        sop_level_list = [item for item in sop_level.children()]
+        layout_node_list = list()
+        for node in sop_level.children():
+            #print(node.path())
+            layout_node_list.append(node.path())
+        
+        #print(sop_level_list)
+        #print(layout_node_list)
+
+        layout_node_target = sop_level.path()
+        #print(layout_node_target)
+
+        hou.node("{}".format(layout_node_target)).layoutChildren(items=(), horizontal_spacing=-1.0, vertical_spacing=-1.0)
+
+        #Set Render Flag for bottom most node after layout
+        all_nodes = sop_level.allSubChildren()
+        #print(all_nodes)
+        bottom_most_node = None
+        for node in all_nodes:
+            #print(node)
+            node_path = hou.node("{}".format(node.path()))
+            #print(node_path)
+            if bottom_most_node is None or node_path.position()[1] < bottom_most_node.position()[1]:
+                bottom_most_node = node_path
+
+        if bottom_most_node:
+            bottom_most_node.setRenderFlag(True)
+            bottom_most_node.setDisplayFlag(True)
+
+        #Hide Other Default Folders
+        #In Python to modify existing folders you cannot just modify the folder directly. You need to copy the folder, modify it and replace the original folder then set the group
+
+        target_node = hou.node("{}".format(sop_level.path()))
+        target_node.setColor(hou.Color((1.0, 0.0, 0.0)))
+
+        template_group = target_node.parmTemplateGroup()
+        
+        #Transform Folder
+        transform_folder = template_group.findFolder("Transform")
+        transform_folder.hide(True)
+        transform_folder_name = transform_folder.name()
+        template_group.replace(transform_folder_name, transform_folder)
+
+        target_node.setParmTemplateGroup(template_group)
 
     def update_start_frame(self, start_frame):
         print("Modifying Start Frame to: {}".format(start_frame))   #Debug
@@ -1208,9 +1717,19 @@ class FlipBookerWindow(QWidget):
         return swap_camera
 
     def swap_camera_to_run_flipbook_settings(self):
-        
+
         code_executed = False
-        self.set_viewport_to_camera()
+        has_camera = True if self.camera_line_edit.text() else False
+        if has_camera:
+            self.set_viewport_to_camera()
+        else:
+            desktop = hou.ui.curDesktop()
+            scene_viewer = hou.paneTabType.SceneViewer
+            scene = desktop.paneTabOfType(scene_viewer)
+
+
+            hou.GeometryViewport.setDefaultCamera(scene, hou.GeometryViewportCamera.stash(self))
+        
         code_executed = True
         hou.ui.triggerUpdate()
         hou.ui.waitUntil(lambda: code_executed)
@@ -1225,116 +1744,317 @@ class FlipBookerWindow(QWidget):
         
         json_path = self.flipbook_video_format_selector.get_json_path(self.flipbook_line_edit.text())
 
-        info, tempdir = self.read_json_settings(json_path)
+        info, tempdir, input_path_bk = self.read_json_settings(json_path)
 
         all_viewports = info["all_viewports"]
+        output_mplay = int(info["output_mplay"])
 
         cur_desktop = hou.ui.curDesktop()
+        
         scene_viewer = hou.paneTabType.SceneViewer
+        #scene_viewer = scene_viewer.findViewport(self.camera_line_edit.text())
         scene = cur_desktop.paneTabOfType(scene_viewer)
+
+        print("scene_viewer: {}".format(scene_viewer))
+        print("scene: {}".format(scene))
         start_frame = int(hou.text.expandString(self.flipbook_start_frame_line_edit.text()))
         end_frame = int(hou.text.expandString(self.flipbook_end_frame_line_edit.text()))
         set_fps = float(hou.text.expandString(self.fps_line_edit.text()))
         
+
         file_path = self.flipbook_line_edit.text()
         file_name = hou.text.expandString(self.name_line_edit.text())
         frame = "$F4"
         padzero = 4
-        ext = self.flipbook_format_select_combobox.currentText()
+        #ext = self.flipbook_format_select_combobox.currentText()
+        ext = "".join([".",self.flipbook_format_select_combobox.currentText()])
 
-        cur_ver = self.ver_select_combobox.currentText()
-        full_path = "".join([file_path, "/", file_name, "_", frame, ".", ext])
-        full_tempdir_path = "".join([tempdir, "/", cur_ver, "/", file_name, "_", frame, ".", ext]).replace("\\", "/")
-        
+        full_path = "".join([file_path, "/", file_name, "_", frame, ext])
+        print("full_path: {}".format(full_path))
+                
         hou.setFps(set_fps, modify_frame_count=True, preserve_keyframes=False, preserve_frame_start=False)
 
         flipbook_options = scene.flipbookSettings().stash()
 
-        code_executed = False
-
-        output_bool = True if os.path.exists(hou.text.expandString(self.flipbook_line_edit.text())) else False
+        output_bool = True if os.path.exists(hou.text.expandString(self.flipbook_line_edit.text())) and info["save_file"] == True else False
+        print("output_bool = {}".format(output_bool))
         if output_bool:
             flipbook_options.output(full_path)
             print("Outputting Frames to: {}".format(full_path))
 
-        flipbook_options.renderAllViewports(int(all_viewports))
+        flipbook_options.renderAllViewports(all_viewports)
         flipbook_options.useResolution(0)
         flipbook_options.frameRange((start_frame, end_frame))
         flipbook_options.cropOutMaskOverlay(1)
-        flipbook_options.outputToMPlay(0)
+        flipbook_options.outputToMPlay(output_mplay)
+        
+        print("File Path for Progress Bar is: {}".format(file_path))
+
+        '''
+        if all_viewports == True:
+            for view_port in hou.SceneViewer.viewports(self):
+                scene.flipbook(hou.SceneViewer.findViewport(view_port), flipbook_options)
+        else:
+            scene.flipbook(scene.curViewport(), flipbook_options)
+        '''
 
         scene.flipbook(scene.curViewport(), flipbook_options)
+
         #hou.SceneViewer
+        #event
+    def copy_files_to_dir(self, source_folder, destination_folder, event):
         
-        code_executed = True
-        
-        
-        if code_executed:
-            
-            source_folder = self.flipbook_line_edit.text()
-            destination_folder = os.sep.join([os.path.expanduser(tempdir), cur_ver]).replace("\\", "/")
-            print("destination folder: {}".format(destination_folder))
-            dest_list = destination_folder.split("/")
-            cur_list_to_compare = os.path.expanduser(tempdir).split("/")
-            missing_dir_list = [dir for dir in cur_list_to_compare if dir not in dest_list]
-            print("Missing Directories: {}".format(missing_dir_list))
-            
-            if not os.path.exists(destination_folder):
-                for directory in missing_dir_list:
-                    new_dir = "".join([tempdir, directory])                
-                    print("Creating Intermittent Temp Dir Directories: {}".format(new_dir))
-                    os.mkdir(new_dir)
-            
-            self.copy_files_to_dir(source_folder, destination_folder)
-        
-    def copy_files_to_dir(self, source_folder, destination_folder):
+        settings_file = self.flipbook_video_format_selector.get_json_path(self.flipbook_line_edit.text())
 
-        files = [file for file in os.listdir(source_folder) if os.path.isfile(os.path.join(source_folder, file))]
+        info, tempdir, input_path_bk = self.read_json_settings(settings_file)
 
-        for file in files:
-            source_path = os.path.join(source_folder, file)
-            destination_path = os.path.join(destination_folder, file)
-            shutil.copyfile(source_path, destination_path)
-            print("File Copying from Source: {} to Destination {}".format(source_path, destination_path))
+        start_frame = int(hou.text.expandString(info["start_frame"]))
+        end_frame = int(hou.text.expandString(info["end_frame"]))
+
+        destination_folder = os.path.expanduser(destination_folder)
+
+        print("start_frame: {}".format(start_frame))
+        print("end_frame: {}".format(end_frame))
+        print("destination_folder = {} and type: {}".format(destination_folder, type(destination_folder)))
+        
+        allowed_extension = info['flipbook_format']
+
+        #allowed_extension = self.flipbook_format_select_combobox.currentText()
+
+        #source_files = [file for file in os.listdir(source_folder) if 
+        #                os.path.isfile(os.path.join(source_folder, file)) and file.lower().endswith(allowed_extension, )]
+        #source_files = [file for file in os.listdir(source_folder) if 
+        #                os.path.isfile(os.path.join(source_folder, file)) and file.split(".")[-1] in file]
+        
+
+        source_files = list()
+
+        print("source_files = {}".format(len(source_files)))
+        print("destination_files = {}".format(len(os.listdir(os.path.expanduser(destination_folder)))))
+        #event.set()
+        #destination_folder = os.path.expanduser(destination_folder)
+        destination_folder_list = [file for file in os.listdir(destination_folder) if os.path.isfile(os.path.join(destination_folder, file)) and file.split(".")[-1] in file and allowed_extension in file.split(".")[-1]]
+        print("destination_folder_list: {}".format(destination_folder_list))
+
+        #os.listdir(destination_folder)
+
+        while len(destination_folder_list) < (end_frame - start_frame + 1):
+            # Repeatedly getting the list of files in the source folder
+
+            source_files = [file for file in os.listdir(source_folder) if 
+                           os.path.isfile(os.path.join(source_folder, file)) and file.split(".")[-1] in file and allowed_extension in file.split(".")[-1]]
+
+            if source_files:
+                print("source file found")
+                for file in source_files:
+                    print("File to look for is: {}".format(file))
+                    source_path = os.path.join(source_folder, file)
+                    destination_path = os.path.join(destination_folder, file)
+
+                    #Check if the file has not been processed yet
+                    #Checks if the file is still being written for 1 second, this is checking if the file is still being written or not
+                    if file not in os.listdir(destination_folder) and self.is_file_writable(source_path, timeout=30):  
+                        shutil.copyfile(source_path, destination_path)
+                        print("File Copying from Source: {} to Destination {}".format(source_path, destination_path))
+
+                    # Check if all the files are Present then Break the Loop
+                if len(source_files) == (end_frame - start_frame + 1):
+                    break
+
+            time.sleep(0.5)
+
+        #Signal that the copying is done
+        event.set()
+    
+    def is_file_writable(self, file_path, timeout):
+        start_time = time.time()
+
+        #repeatingly check until timeout is reached
+        while True:
+            try:
+                current_size = os.path.getsize(file_path)
+                print("current file size: {}".format(current_size))
+                time.sleep(1)
+                new_size = os.path.getsize(file_path)
+                print("new size: {}".format(new_size))
+                print("checking if file is still being modified")
+
+                if current_size == new_size and new_size > 0 and os.access(file_path, os.W_OK):
+                    print("successfully opened file and is writable")
+                    return True
+            
+            except Exception as e:
+                time.sleep(0.1) #intervals of checking the file on repeat
+                print("open failed. Trying again")
+
+                if time.time() - start_time > timeout:
+                    return False
+
+    def thread_progress_bar(self, event):
+        
+        settings_file = self.flipbook_video_format_selector.get_json_path(self.flipbook_line_edit.text())
+
+        info, tempdir, input_path_bk = self.read_json_settings(settings_file)
+        
+        file_path = self.flipbook_line_edit.text()
+
+        start_frame = int(hou.text.expandString(self.flipbook_start_frame_line_edit.text()))
+        end_frame = int(hou.text.expandString(self.flipbook_end_frame_line_edit.text()))
+
+        allowed_extension = info["flipbook_format"]
+        
+        total_frames = (int(end_frame) - int(start_frame) + 1)
+        current_file_list = [file for file in os.listdir(self.flipbook_line_edit.text()) if os.path.isfile("".join((file_path, file))) and file.lower().endswith(allowed_extension)]
+        
+        progress_step = 1/total_frames
+
+        while len(current_file_list) < total_frames:
+            print("current_file_list to eval: {}".format(current_file_list))
+
+            print("current_file_list: {}". format(current_file_list))
+            #if os.path.exists(destination_folder):
+            #    self.copy_files_to_dir(source_folder, destination_folder)
+            progress_value = int(round(len(current_file_list) * progress_step, 2) * 100)            
+
+            progress_event = ProgressUpdateEvent(progress_value)
+            QCoreApplication.postEvent(self, progress_event)
+
+            time.sleep(0.1)
+
+            if progress_value == 100:
+                time.sleep(0.5)
+                self.load_progress_bar.setValue(0)
+                break
+
+        event.set()
 
     def run_flipbook(self):
         #run set to viewport to camera method
         options = DummyCommands()
+        file_name_list = options.file_name_list
+        print("name list: {}".format(file_name_list))
         directory = str(options.dir)
+        print("directory: {}".format(directory))
         file_no_version = str(options.file_no_version)
+        print("file no version: {}".format(file_no_version))
         hip_formats = str(options.hip_formats)
         ext = str(options.ext)
+        file_path = str(options.file_path)
+        file_name = str(options.file_name)
+        frame = "$F4"
 
-        hfiles_in_dir = options.scan_dir_for_files(directory, file_no_version, hip_formats)
+        original_directory = self.flipbook_line_edit.text().split("/flipbook")[0]
+        print("original_directory: {}".format(original_directory))
+
+        hfiles_in_dir = options.scan_dir_for_files(original_directory, file_no_version, hip_formats)
+        print("hfiles in dir: {}".format(hfiles_in_dir))
         next_version = options.get_next_version(hfiles_in_dir)
+
+        json_path = self.flipbook_video_format_selector.get_json_path(self.flipbook_line_edit.text())
+        info, tempdir, input_path_bk = self.read_json_settings(json_path)
 
         pattern = r'v\d+'
         matched = re.search(pattern, hou.hipFile.basename())
+
+        comment = info["comment"]
+
+        cur_format = self.flipbook_format_select_combobox.currentText()
+
         if matched:
             out_new_file = "{}_v{}{}".format(file_no_version, next_version, ext)
         else:
             out_new_file = "{}_{}{}".format(file_no_version, next_version, ext)
 
+        print("out_new_file: {}".format(out_new_file))
+        print("directory: {}".format(directory))
+        print("file_path: {}".format(file_path))
+        print("file_name: {}".format(file_name))
+        print("file_no_version: {}".format(file_no_version))
+        print("hfiles_in_dir: {}".format(hfiles_in_dir))
+        print("next_version: {}".format(next_version))
+
+        cur_ver = self.ver_select_combobox.currentText()
+
+        full_tempdir_path = "".join([tempdir, "/", cur_ver, "/", file_name, "_", frame, ".", ext]).replace("\\", "/")
+
+        save_file_bool = info["save_file"]
+
+        source_folder = self.flipbook_line_edit.text()
+        destination_folder = os.sep.join([os.path.expanduser(tempdir), cur_ver]).replace("\\", "/")
+        print("destination folder: {}".format(destination_folder))
+
+        dest_list = destination_folder.split("/")
+        print("dest_list: {}".format(dest_list))
+
+        cur_list_to_compare = os.path.expanduser(tempdir).replace("\\", "/").split("/")
+        print("cur_list_to_compare: {}".format(cur_list_to_compare))
+
+        missing_dir_list = [dir for dir in dest_list if dir not in cur_list_to_compare]
+        print("Missing Directories: {}".format(missing_dir_list))
+        
+        if comment:
+            if not os.path.exists(destination_folder):
+                for directory in missing_dir_list:
+                    new_dir = "/".join([tempdir, directory]).replace("\\", "/")                
+                    if not os.path.exists(new_dir):
+                        print("Creating Intermittent Temp Dir Directories: {}".format(new_dir))
+                        os.mkdir(new_dir)
+                    tempdir = new_dir
+            else:
+                #Check if there are existing files from potential previous flipbooks and delete them before running the operation again
+                #files_to_check = [item for item in os.listdir(destination_folder) if os.path.isfile(os.path.join(destination_folder, item).replace("\\", "/")) and cur_format in item.split(".")[-1]]
+                #print("files to check: {}".format(files_to_check))
+                #file_full_paths = [os.path.join(destination_folder, file).replace("\\", "/") for file in files_to_check]
+                #print("file full paths: {}".format(file_full_paths))
+
+                file_full_paths = [(os.path.join(destination_folder, item).replace("\\", "/"), item) for item in os.listdir(destination_folder) if os.path.isfile(os.path.join(destination_folder, item).replace("\\", "/")) and cur_format in item.split(".")[-1]]
+                print("file_full_paths: {}".format(file_full_paths))
+                if len(file_full_paths) > 0: #This logic might need to be changed based on what happens
+                    #shutil.rmtree(destination_folder)
+                    #for file_path in glob.glob(os.path.join(destination_folder, '*')):
+                    for file_path in file_full_paths:
+                        print("file_path: {}".format(file_path))
+                        os.remove(file_path)
+                    
         out_current_file = "{}".format(hou.hipFile.basename())
 
-        export_new_path = path.join(directory, out_new_file)
-        export_current_path = path.join(directory, out_current_file)
+        export_new_temp_path = os.path.join(destination_folder, out_new_file).replace("\\", "/")  #changing from source_folder to destination folder
+        print("export_new_path: {}".format(export_new_temp_path))
+        export_current_temp_path = os.path.join(destination_folder, out_current_file).replace("\\", "/")
+        print("export_current_path = {}".format(export_current_temp_path))
 
-        save_next_ver_to_flipbook_file = "".join([hou.text.expandString(self.flipbook_line_edit.text()), "/", next_version, ext])
-        save_current_ver_to_flipbook_file = "".join([hou.text.expandString(self.flipbook_line_edit.text()), "/", hou.hipFile.basename()])
+        original_directory_new_file = "".join([original_directory, "/", out_new_file])
+        original_directory_current_file = "".join([original_directory, "/", hou.hipFile.basename()])
+
+        save_next_ver_to_flipbook_file_folder = "".join([hou.text.expandString(self.flipbook_line_edit.text()), "/", out_new_file])
+        print("save_next_ver_to_flipbook_file: {}".format(save_next_ver_to_flipbook_file_folder))
+        save_current_ver_to_flipbook_file_folder = "".join([hou.text.expandString(self.flipbook_line_edit.text()), "/", hou.hipFile.basename()])
+        print("save_current_ver_to_flipbook_file: {}".format(save_current_ver_to_flipbook_file_folder))
 
         message_box = QMessageBox()
         message_box.setText("You have Unsaved Changes. Do you want to Save before Running the Flipbook?")
         option_1 = message_box.addButton("Save Next Version", QMessageBox.AcceptRole)
-        option_2 = message_box.addButton("Overwrite Current Version", QMessageBox. AcceptRole)
+        option_2 = message_box.addButton("Overwrite Current Version", QMessageBox.AcceptRole)
         option_3 = message_box.addButton("Run Flipbook Without Saving", QMessageBox.AcceptRole)
         option_4 = message_box.addButton("Cancel", QMessageBox.RejectRole)
         
         message_box.setDefaultButton(option_1)
 
-        new_path_list = [export_new_path, save_next_ver_to_flipbook_file]
-        current_path_list = [export_new_path, save_next_ver_to_flipbook_file]
+        new_path_list = [export_new_temp_path, save_next_ver_to_flipbook_file_folder, original_directory_new_file]
+        current_path_list = [export_current_temp_path, save_current_ver_to_flipbook_file_folder, original_directory_current_file]
 
+        #Threading
+        
+        copy_thread_event = threading.Event()
+        progressbar_thread_event = threading.Event()
+
+        copy_thread = threading.Thread(target=self.copy_files_to_dir, args=(source_folder, destination_folder, copy_thread_event))
+        progressbar_thread = threading.Thread(target=self.thread_progress_bar, args=(progressbar_thread_event, ))
+
+        progressbar_thread_event.set()
+        copy_thread_event.set()
+
+        
         #print(save_path)
         if hou.hipFile.hasUnsavedChanges():
             #reply = QMessageBox.question(self, "Question", "You have Unsaved Changes. Do you want to Save before Running the Flipbook?",
@@ -1351,8 +2071,27 @@ class FlipBookerWindow(QWidget):
 
                 hou.ui.triggerUpdate()
                 hou.ui.waitUntil(lambda: code_executed)
-                self.swap_camera_to_run_flipbook_settings()
-                #self.call_progress_bar(str(self.flipbook_line_edit.text()))
+                #self.swap_camera_to_run_flipbook_settings()
+
+                if save_file_bool and comment:
+                    copy_thread.start()
+                    print("copy thread starting....\n")
+                
+                #progressbar_thread.start()
+                QCoreApplication.postEvent(self, QEvent(QEvent.User))
+                #force method to run on mainthread
+                #QMetaObject.invokeMethod(self, "swap_camera_to_run_flipbook_settings", Qt.QueuedConnection)
+
+                if save_file_bool and comment:
+                    #Wait for threading to finish before proceeding
+                    copy_thread.join(timeout=10)
+                    #progressbar_thread.join(timeout=10)
+
+                    if copy_thread.is_alive():
+                        self.convert_vid_btn.setEnabled(False)
+                    else:
+                        self.convert_vid_btn.setEnabled(True)
+
 
             elif message_box.clickedButton() == option_2:
                 code_executed = False
@@ -1364,26 +2103,86 @@ class FlipBookerWindow(QWidget):
 
                 hou.ui.triggerUpdate()
                 hou.ui.waitUntil(lambda: code_executed)
-                self.swap_camera_to_run_flipbook_settings()
-                #self.call_progress_bar(str(self.flipbook_line_edit.text()))
+                #self.swap_camera_to_run_flipbook_settings()
+
+                if save_file_bool and comment:
+                    copy_thread.start()
+                    print("copy thread starting....")
+
+                #progressbar_thread.start()
+                QCoreApplication.postEvent(self, QEvent(QEvent.User))
+                #QMetaObject.invokeMethod(self, "swap_camera_to_run_flipbook_settings", Qt.QueuedConnection)
+
+                if save_file_bool and comment:
+                    #Wait for threading to finish before proceeding
+                    copy_thread.join(timeout=10)
+                    #progressbar_thread.join(timeout=10)
+
+                    if copy_thread.is_alive():
+                        self.convert_vid_btn.setEnabled(False)
+                    else:
+                        self.convert_vid_btn.setEnabled(True)
 
             elif message_box.clickedButton() == option_3:
-                code_executed = False
-                hou.hipFile.save(save_current_ver_to_flipbook_file, False)
-                code_executed = True
-                self.swap_camera_to_run_flipbook_settings()
-                #self.call_progress_bar(str(self.flipbook_line_edit.text()))
+                #code_executed = False
+                #hou.hipFile.save(save_next_ver_to_flipbook_file_folder, False)
+                #code_executed = True
+                #self.swap_camera_to_run_flipbook_settings()
+                
+                if save_file_bool and comment:
+                    copy_thread.start()
+                    print("copy thread starting....")
+
+                #progressbar_thread.start()
+                QCoreApplication.postEvent(self, QEvent(QEvent.User))
+                #QMetaObject.invokeMethod(self, "swap_camera_to_run_flipbook_settings", Qt.QueuedConnection)
+
+                if save_file_bool and comment:
+                    #Wait for threading to finish before proceeding
+                    copy_thread.join(timeout=10)
+                    #progressbar_thread.join(timeout=10)
+
+                    if copy_thread.is_alive():
+                        self.convert_vid_btn.setEnabled(False)
+                    else:
+                        self.convert_vid_btn.setEnabled(True)
 
             elif message_box.clickedButton() == option_4:
                 pass
         else:
-            self.swap_camera_to_run_flipbook_settings()
+            #self.swap_camera_to_run_flipbook_settings()
             output_bool = True if len(hou.text.expandString(self.flipbook_line_edit.text())) > 0 and os.path.exists(hou.text.expandString(self.flipbook_line_edit.text())) else False
-            if output_bool:
+            
+            if output_bool and comment:
                 #self.call_progress_bar(str(self.flipbook_line_edit.text()))
-                pass
+                #progressbar_thread.start()
+                copy_thread.start()
+                print("copy thread starting....")
 
+                #progressbar_thread.join(timeout=10)
+            #QMetaObject.invokeMethod(self, "swap_camera_to_run_flipbook_settings", Qt.QueuedConnection)    
+            QCoreApplication.postEvent(self, QEvent(QEvent.User)) 
 
+            if save_file_bool and comment:
+                #Wait for threading to finish before proceeding
+                copy_thread.join(timeout=10)
+                #progressbar_thread.join(timeout=10)
+
+                if copy_thread.is_alive():
+                    self.convert_vid_btn.setEnabled(False)
+                else:
+                    self.convert_vid_btn.setEnabled(True)  
+            
+    def customEvent(self, event):
+        
+        if isinstance(event, ProgressUpdateEvent):
+            progress_value = event.progress_value
+            self.load_progress_bar.setValue(progress_value)
+
+        if event.type() == QEvent.User:
+            self.launch_flip_book_btn.setEnabled(False)
+            self.swap_camera_to_run_flipbook_settings()
+            self.launch_flip_book_btn.setEnabled(True)
 
 ########################################################################################
 # Handle Text and Fit to Top Left
@@ -1392,9 +2191,15 @@ class FlipBookerWindow(QWidget):
         settings_file = self.flipbook_video_format_selector.get_json_path(self.flipbook_line_edit.text())
         print(settings_file)
 
-        info, tempdir = self.read_json_settings(settings_file)
+        info, tempdir, input_path_bk = self.read_json_settings(settings_file)
 
-        font = ImageFont.truetype(font=ImageFont.load_default(), size=font_size)
+        #default_font = ImageFont.load_default()
+
+        sys_font_path = info["sys_font_path"]
+
+        #font = ImageFont.truetype(font=ImageFont.load_default, size=font_size)
+        font = ImageFont.truetype(font=sys_font_path, size=font_size)
+        #font = default_font.font_variant(size=font_size)
 
         draw = ImageDraw.Draw(Image.new('RGBA', (1, 1)))    #Create temp image to get text size
         text_width, text_height = draw.textsize(text,font)
@@ -1419,7 +2224,6 @@ class FlipBookerWindow(QWidget):
         y = blur_radius
 
         #Draw Drop Shadow for Text
-        Image.new()
         shadow = Image.new('RGBA', image.size)
         shadow_draw = ImageDraw.Draw(shadow)
         shadow_draw.text((x + blur_radius, y + blur_radius), text, font=font, fill=shadow_color)
@@ -1433,85 +2237,215 @@ class FlipBookerWindow(QWidget):
         return image
 
     def save_text_to_image(self):
+        
+        json_path = self.flipbook_video_format_selector.get_json_path(self.flipbook_line_edit.text())
+
+        info, tempdir, input_path_bk = self.read_json_settings(json_path)
 
         start_frame = int(hou.text.expandString(self.flipbook_start_frame_line_edit.text()))
         end_frame = int(hou.text.expandString(self.flipbook_end_frame_line_edit.text()))
 
-        name = hou.text.expandString(self.name_line_edit.text())
+        name = "_".join([hou.text.expandString(self.name_line_edit.text()), "comment"])
         #text_path = hou.text.expandString(self.flipbook_line_edit.text())
+        print("name: {}".format(name))
+
         
-        image_format = "png"     #self.flipbook_format_select_combobox.currentText()
+        cur_image_format = info['flipbook_format']
+        print("cur_image_format: {}".format(cur_image_format))
+        text = str()
+        path_dir = str()
 
-        json_path = self.flipbook_video_format_selector.get_json_path(self.flipbook_line_edit.text())
+        cur_ver = self.ver_select_combobox.currentText()
 
-        info, tempdir = self.read_json_settings(json_path)
-
-        cur_ver = "".join(["v",self.ver_select_combobox.currentText()])
-
-        font_size = info[font_size]
+        font_size = info['font_size']
 
         padzero = 4
-        comment_text = info["comment_text"]
         comment = info['comment']
-        if comment and comment_text and self.add_comment_checkbox.isChecked():
-
+        
+        if comment:
+            
+            comment_text = info["comment_text"]
             #camera_node = hou.ui.paneTabOfType(hou.paneTabType.SceneViewer).curViewport().camera()
-            camera_node = self.camera_line_edit.text().split("/")[-1]
-            print("Current Camera Evaluated is: {}".format(camera_node))    #Debug
+            camera_name = self.camera_line_edit.text().split("/")[-1]
+            print("Current Camera Evaluated is: {}".format(camera_name))
+                #Debug
+            camera_node = hou.node(self.camera_line_edit.text())
+            print("camera node is {}".format(camera_node))
+
             if camera_node:
                 #comment_text = str(comment_text).replace('[shotcam]', camera_node.name())
-                comment_text = str(comment_text).replace('[shotcam]', camera_node)
+                comment_text = str(comment_text).replace('[shotcam]', camera_name)
             else:
                 comment_text = str(comment_text).replace('[shotcam]', "")
 
             print("Incoming Comment Text for Camera is: {}".format(comment_text))   #Debug
 
-            for frame in range((end_frame - start_frame) + 1):
-                path_dir = "{}/{}/{}_{}.{}".format(tempdir, cur_ver, name, str(frame).zfill(padzero), image_format)
-                print("Output Directory: {}".format(path_dir))  #Debug
-                display_text_info = hou.expandStringAtFrame(comment_text, frame)
+        else:
+            comment_text = ""
 
-                comment_list = list()
-                if '\n' in comment_text:
-                    for line in comment_text.split('\n'):
-                        text = hou.expandStringAtFrame(line, frame + start_frame)                         
+        for frame in range(start_frame, end_frame - start_frame + 1):
+            
+            code_executed = False
 
+            path_dir = "{}/{}/{}_{}.{}".format(os.path.expanduser(tempdir).replace("\\", "/"), cur_ver, name, str(frame).zfill(padzero), "png")
+            print("Output Directory: {}".format(path_dir))  #Debug
+            text = hou.expandStringAtFrame(comment_text, frame)
+            print("text: {}".format(text))
 
-                #Keep only first two decimal places of the float number
-                matched = re.search('\d + \d*)\d', display_text_info)
+            comment_list = list()
+            if '\n' in comment_text:
+                for line in comment_text.split('\n'):
+                    text = hou.expandStringAtFrame(line, frame + start_frame)                         
 
-                if matched:
-                    float_number = matched.group(1)
-                    formatted_float = str(round(float(float_number), 2))
-                    text = text.replace(float_number, formatted_float)
-                comment_list.append(text)
+                    #Keep only first two decimal places of the float number
+                    matched = re.search('(\d+\.\d*)\d*', text)
 
-                text = '\n'.join(comment_list)
+                    if matched:
+                        float_number = matched.group(1)
+                        formatted_float = str(round(float(float_number), 2))
+                        text = text.replace(float_number, formatted_float)
+                    comment_list.append(text)
+
+                    text = '\n'.join(comment_list)
+
+            code_executed = True
         
-        result_image = self.generate_text(text, font_size)
-        result_image.save(path_dir)
+            if code_executed:
+                result_image = self.generate_text(text, font_size)
+                result_image.save(path_dir, format="png")
 
-        return result_image
-    
 ########################################################################################
 # Encoder
     def organize_temp_dir_files(self):
 
         json_path = self.flipbook_video_format_selector.get_json_path(self.flipbook_line_edit.text())
 
-        info, tempdir = self.read_json_settings(json_path)
+        info, tempdir, input_path_bk = self.read_json_settings(json_path)
+
+        tempdir = os.path.expanduser(tempdir)
+
+        cur_ver = self.ver_select_combobox.currentText()
+        name = hou.text.expandString(self.name_line_edit.text())
+        frame = hou.text.expandString("$F4")
+        flipbook_format = self.flipbook_format_select_combobox.currentText()
+
+#evaluate all options for video formats
+        
+        input_path = hou.text.expandString(self.video_line_edit.text())
+
+        video_file_count = 1
+        video_files = os.listdir(input_path)
+        for video_file in video_files:
+            if video_file.lower().endswith(".mp4") or video_file.lower().endswith(".mov") or video_file.lower().endswith(".avi"):
+                video_file_count += 1
+
+        version = video_file_count
+
+        name = hou.text.expandString(self.name_line_edit.text())
+
+        video_name = "".join([name, "_v{}".format(version)])
+
+        video_format = str(self.video_format_select_combobox.currentText())
+
+        #video_path = "".join([input_path, video_name, ".", video_format])   ############# Progressed here so far
+        video_path = self.video_line_edit.text()
+
+        ffmpeg_path = hou.text.expandString(self.ffmpeg_line_edit.text())
+
+        flipbook_path = hou.text.expandString(self.flipbook_line_edit.text())
+
+        #should probably change this to have their own directories for background and foreground files
+
+        path_to_check = "".join([tempdir, "/", cur_ver])
+        background_files = [os.path.join(path_to_check, file).replace("\\", "/") for file in os.listdir(path_to_check) if flipbook_format in file.split(".")[-1] and "comment" not in file]
+        foreground_files = [os.path.join(path_to_check, file).replace("\\", "/") for file in os.listdir(path_to_check) if file.lower().endswith('.png') and "comment" in file]
+        
+
+        background_files.sort()
+        foreground_files.sort()
+        print("background_files: {}".format(background_files))
+        print("foreground_files: {}".format(foreground_files))
+
+        fps = hou.text.expandString(self.fps_line_edit.text())
+
+        return background_files, foreground_files
+
+    def overlay_and_save_frames(self, background_file, foreground_file, target_file):
+        
+        background = Image.open(background_file).convert('RGBA')
+        foreground = Image.open(foreground_file).convert('RGBA')
+
+        #paste foreground and background into a new image
+        combined = Image.new('RGBA', background.size)
+        combined.paste(background, (0, 0))
+        combined.paste(foreground, (0, 0), foreground)
+
+        #save combined image
+        combined.save(target_file)
+
+        return target_file
+    
+    def get_sort_image_files(self, directory, extensions):
+
+        image_files = {ext: [] for ext in extensions}
+
+        for file in os.listdir(directory):
+            for ext in extensions:
+                if file.lower().endswith(ext) and os.path.isfile(os.path.join(directory, file).replace("\\", "/")) and os.path.exists(os.path.join(directory, file).replace("\\", "/")) and self.name_line_edit.text() in file:
+                    image_files[ext].append(os.path.join(directory, file).replace("\\", "/"))
+
+        return image_files
+    
+    def open_mplay(self, image_sequence_path):
+
+        allowed_extensions = ["picnc", "piclc", "pic"]  #order here matters by priority
+
+        image_files_dict = self.get_sort_image_files(image_sequence_path, allowed_extensions)
+
+        for ext in allowed_extensions:
+            image_files = image_files_dict[ext]
+
+        #mplay_pane = hou.ui.paneTabOfType(hou.paneTabType.Mplay)
+            
+        #if not mplay_pane:
+        #    mplay_pane = hou.ui.paneTabOfType(hou.paneTabType.SceneViewer).createFloatingtTab(hou.paneTabType.MPlay)
+
+        #mplay_pane.setCurrentDirectory(image_sequence_path)
+
+        #mplay_pane.pwd().hscrpt(f"image_files {image_files}")
+
+        image_files = "Mandril.pic butterfly.pic" 
+
+        image_files = " ".join(map(repr, image_files))  
+
+        print(image_files)
+
+        command = [f"mplay", image_files]
+        
+        #os.system(command)
+
+    def run_all_image_operations_and_encode(self):
+
+        self.convert_vid_btn.setEnabled(False)
+        self.add_comment_checkbox.setCheckable(False)
+
+        code_executed_wrapper = False
+
+        settings_file = self.flipbook_video_format_selector.get_json_path(self.flipbook_line_edit.text())
+
+        info, tempdir, input_path_bk = self.read_json_settings(settings_file)
+
+        input_path = hou.text.expandString(self.video_line_edit.text())
+
+        encoder = 'libx264'
 
         if self.flipbook_video_format_selector.cur_video_format == 'mp4' or self.flipbook_video_format_selector.cur_video_format == '.avi':
             encoder = 'libx264'
         if self.flipbook_video_format_selector.cur_video_format == 'mov':
             encoder = 'prores'
 
-        cur_ver = "".join(["v",self.ver_select_combobox.currentText()])
         name = hou.text.expandString(self.name_line_edit.text())
-        frame = hou.text.expandString("$F4")
-        flipbook_format = self.flipbook_format_select_combobox.currentText()
-
-#evaluate all options for video formats
+        print("name: {}".format(name))
 
         video_file_count = 1
         video_files = os.listdir(input_path)
@@ -1526,46 +2460,187 @@ class FlipBookerWindow(QWidget):
         video_format = str(self.video_format_select_combobox.currentText())
 
         #video_path = "".join([input_path, video_name, ".", video_format])   ############# Progressed here so far
-        video_path = self.video_line_edit.text()
+        video_path = "".join([self.video_line_edit.text(), "/", video_name, ".", video_format]).replace("/", "\\") 
+        print("video path output string: {}".format(video_path))
 
-        #default_font = ""
-
-        ffmpeg_path = hou.text.expandString(self.ffmpeg_line_edit.text())
-
-        flipbook_path = hou.text.expandString(self.flipbook_line_edit.text())
-
-        name = hou.text.expandString(self.name_line_edit.text())
-
-        input_path = hou.text.expandString(self.video_line_edit.text())
-
+        auto_backup = info["auto_backup"]
         comment = info['comment']
-        comment_text = info['comment_text']
+        cur_ver = self.ver_select_combobox.currentText()
+        flipbook_path = self.flipbook_line_edit.text()
 
-        if comment and comment_text and self.add_comment_checkbox.isChecked():
-            path_to_check = "".join([tempdir, "/", cur_ver])
-            background_files = [os.path.join(path_to_check, file) for file in os.listdir(path_to_check) if file.lower().endswith(flipbook_format)]
-            foreground_files = [os.path.join(path_to_check, file) for file in os.listdir(path_to_check) if file.lower().endswith('.png')]
+        start_frame = hou.text.expandString(self.flipbook_start_frame_line_edit.text())
+        end_frame = hou.text.expandString(self.flipbook_end_frame_line_edit.text())
 
-            background_files.sort()
-            foreground_files.sort()
+        camera_node = hou.node(self.camera_line_edit.text())
+        if camera_node:
+            camera_node_res_x = camera_node.parm("resx").eval()
+            camera_node_res_y = camera_node.parm("resy").eval()
+            print("res_x: {}".format(camera_node_res_x))  #Debug
+            print("res_y: {}".format(camera_node_res_y)) #Debug
 
-            fps = hou.text.expandString(self.fps_line_edit.text())
+        ffmpeg_path = os.path.expanduser(hou.text.expandString(self.ffmpeg_line_edit.text()))
+        
+        '''
 
-    def overlay_and_save_frames(self, background_file, foreground_file, output_file):
-        background = Image.open(background_file).convert('RGBA')
-        foreground = Image.open(foreground_file).convert('RGBA')
+        desktop = hou.ui.curDesktop()
+        no_cam_viewport = desktop.paneTabOfType(hou.paneTabType.SceneViewer)
 
-        #paste foreground and background into a new image
-        combined = Image.new('RGBA', background.size)
-        combined.paste(background, (0, 0))
-        combined.paste(foreground, (10, 10), foreground)
+        camera = hou.GeometryViewport.defaultCamera(no_cam_viewport)
+        camera_stashed = camera.stash()
 
-        #save combined image
-        combined.save(output_file)
+        
+        if camera_node:
+            camera_resolution = hou.GeometryViewport().resolutionInPixels(camera_node)
+        else:
+            camera_resolution = hou.GeometryViewport().resolutionInPixels(camera_stashed)
 
-    def run_all_image_ops(self):
+        print(camera_resolution)
+        
+        '''
+
+        padding = 4
+
+        png_ext = "png" #this is for combining the comment text and flipbook encoding video
+
+        cur_ext = self.flipbook_format_select_combobox.currentText()    #This is for no comment encoding video
+
+        name_w_text = "_".join([hou.text.expandString(self.name_line_edit.text()), "combined"])
+        fps = hou.text.expandString(self.fps_line_edit.text())
+
+        tmp_tempdir = os.path.expanduser(tempdir).replace("\\", "/")
+
+        dir_path = "{}/{}/flipbook_w_text".format(os.path.expanduser(tempdir), cur_ver).replace("\\", "/")
+
+        orig_dir_path = os.path.expanduser(tempdir).replace("\\", "/")
+        
+        dir_path_list = dir_path.split("/")
+
+        orig_dir_path_list = orig_dir_path.split("/")
+
+        missing_dir_list = [item for item in dir_path_list if item not in orig_dir_path_list]
+
+        directory = self.flipbook_line_edit.text()
+
+        print("missing directories: {}". format(missing_dir_list))
+
+        for dir_item in missing_dir_list:
+            new_dir = "/".join([tmp_tempdir, dir_item])
+            print(new_dir)
+            if not os.path.exists(new_dir):
+                print("creating new dir: {}".format(new_dir))
+                os.mkdir(new_dir)
+            tmp_tempdir = new_dir
+            print("new tmp tempdir: {}".format(tmp_tempdir))
+
         threads = list()
 
+        current_vid_combobox_selection = self.flipbook_format_select_combobox.currentText()
+
+        if current_vid_combobox_selection == "pic":
+
+            self.open_mplay(directory)
+        
+        else:
+
+            if comment:
+                print("Running Video Generation with Comment Combination")
+                code_executed_copy = False
+
+                self.save_text_to_image()
+                background_files, foreground_files = self.organize_temp_dir_files()
+
+                #thread through background files and foreground files
+                for index, (background_files, foreground_files) in enumerate(zip(background_files, foreground_files)):
+                    output_file = os.path.join(dir_path, "{}_{}.{}".format(name_w_text, str(index).zfill(padding), png_ext))
+                    thread = threading.Thread(target=self.overlay_and_save_frames, args=(background_files, foreground_files, output_file))
+                    thread.start()
+                    threads.append(thread)
+
+                #wait for threads to finish
+                for thread in threads:
+                    thread.join()   #code waits for the threads to finish before proceeding with the rest of the code.
+
+                code_executed_copy = True
+
+                if code_executed_copy:
+                    if camera_node:
+                        command = [ffmpeg_path, "-y",
+                                "-framerate", str(fps),
+                                "-i", "{}/{}_%0{}d.{}".format(dir_path, name_w_text, padding, png_ext),
+                                '-c:v', encoder,
+                                '-pix_fmt', 'yuv420p',
+                                '-vf', 'scale={}:-2'.format(str(camera_node_res_x)),
+                                video_path]
+                        
+                        print("Output Video Command Running using Camera Settings")
+                    else:
+                        command = [ffmpeg_path, "-y",
+                                "-framerate", str(fps),
+                                "-i", "{}/{}_%0{}d.{}".format(dir_path, name_w_text, padding, png_ext),
+                                '-c:v', encoder,
+                                '-pix_fmt', 'yuv420p',
+                                '-vf', 'scale=1920:-2',
+                                video_path]
+                        
+                        print("Output Video Command Running using Default Settings")
+
+                result = subprocess.run(command, capture_output=True, text=True)
+
+            else:
+                print("Running Video Generation with No Comment")
+                image_path =  "{}/{}_%0{}d.{}".format(flipbook_path, name, padding, cur_ext)
+                print("image_path: {}".format(image_path))
+                if camera_node:
+                    video_filter = 'scale={}:-2'.format(camera_node_res_x)
+
+                    command =[ffmpeg_path, "-y",
+                                "-framerate", str(fps),
+                                "-i", image_path,
+                                '-c:v', encoder,
+                                '-pix_fmt', 'yuv420p',
+                                '-vf', video_filter,
+                                video_path]
+                else:
+                    video_filter = 'scale=1920:-2'
+                    
+                    command =[ffmpeg_path, "-y",
+                                "-framerate", str(fps),
+                                "-i", image_path,
+                                '-c:v', encoder,
+                                '-pix_fmt', 'yuv420p',
+                                '-vf', video_filter,
+                                video_path]
+                    
+                result = subprocess.run(command, capture_output=True, text=True)
+
+            code_executed_inner = False
+
+            if result.returncode == 0:
+
+                video_path_print = video_path.replace("/", "\\")
+                print("Successfully Generated Flipbook to: {}".format(video_path_print))
+                if auto_backup:
+                    hou.hipFile.save()
+                    shutil.copy2(hou.hipFile.name(), input_path_bk + video_name + '.hip')
+
+                os.startfile(video_path_print)
+
+            else:
+                print("Video Output Not Successful")
+
+            code_executed_inner = True
+            
+            if comment:
+                if code_executed_inner == True:
+                    path_to_remove = "/".join([os.path.expanduser(tempdir), cur_ver])
+                    print("path to remove: {}".format(path_to_remove))
+                    shutil.rmtree(path_to_remove)
+            
+            code_executed_wrapper = True
+
+            if code_executed_wrapper:
+                self.convert_vid_btn.setEnabled(True)
+                self.add_comment_checkbox.setCheckable(True)
         #Multithread overlay and save frame
         
 ########################################################################################
@@ -1576,16 +2651,21 @@ class FlipBookerWindow(QWidget):
         end_frame = int(hou.text.expandString(self.flipbook_end_frame_line_edit.text()))
         #start_frame = 1 #Debug
         #end_frame = 240 #Debug
+        ext = "".join([".",self.flipbook_format_select_combobox.currentText()])
 
-        self.thread = ProgressBarThread()
+        self.thread = ProgressBarThread(path, ext, start_frame, end_frame)
+
         self.thread.update_progress.connect(self.update_progress_bar)
         self.thread.finished.connect(self.update_progress_bar_finished)
         
         self.load_progress_bar.setValue(0)
-        self.thread.run(path, start_frame, end_frame)
+        self.thread.start()
+
+        self.thread.wait()
     
     def update_progress_bar(self, value):
         self.load_progress_bar.setValue(value)
+        return value
 
     def update_progress_bar_finished(self):
         #self.load_progress_bar.setValue(0)
